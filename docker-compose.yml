@@ -1,0 +1,25 @@
+version: '3'
+
+services: 
+    app:  
+        build: 
+            context: .
+            dockerfile: Dockerfile
+        container_name: service
+        ports: 
+            - '9090:8080'
+        depends_on: 
+        - postgres
+
+    postgres:
+        image: postgres
+        container_name: objects
+        ports: 
+          - '5440:5432'
+        volumes: 
+          - my_go_db:/var/lib/postgresql/data
+        environment: 
+          - POSTGRES_PASSWORD=12345  
+         
+volumes: 
+    my_go_db:   
