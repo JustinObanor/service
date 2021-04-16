@@ -7,5 +7,5 @@ FROM debian:10
 WORKDIR /app
 COPY --from=0 /app/service .
 
-EXPOSE 8080
+EXPOSE 9090
 CMD ["/app/service"]

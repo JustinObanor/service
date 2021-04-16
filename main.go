@@ -1,18 +1,20 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 )
 
@@ -28,6 +30,12 @@ type ObjectDetail struct {
 	LastSeen time.Time
 }
 
+// result is a ds that holds possible errors and/or object details using a channel while fetching the detail of an object
+type result struct {
+	objectDetail ObjectDetail
+	err          error
+}
+
 var (
 	db       *sql.DB
 	host     = getenv("PSQL_HOST", "objects")
@@ -37,168 +45,160 @@ var (
 	dbname   = getenv("PSQL_DB_NAME", "objects")
 )
 
-func newObjectRequest() *ObjectList {
+func newObjectList() *ObjectList {
 	return &ObjectList{
 		ObjectIDs: make([]int, 0, 200),
 	}
 }
 
-func main() {
-	var (
-		err                error
-		httpAddr           = flag.String("http", ":8080", "http listen address")
-		callbackHTTPAddr   = flag.String("api1", ":9090", "http listen address for callbacks body")
-		objectInfoHTTPAddr = flag.String("api2", ":9010", "http listen address for getting info by object id")
-	)
-
+func init() {
+	var err error
 	db, err = sql.Open("postgres", fmt.Sprintf(`host=%s port=%s user=%s
 		password=%s dbname=%s sslmode=disable`,
 		host, port, user, password, dbname))
 	if err != nil {
 		log.Fatal("error opening connection to postgres: ", err)
 	}
-
 	if err := db.Ping(); err != nil {
 		log.Fatal("error pinging postgres client: ", err)
 	}
+	log.Printf("connected to psql client, host: %s\n", host)
+}
+
+func main() {
+	callbackAddr := flag.String("callback", ":9090", "http listen address for callbacks body")
 
 	flag.Parse()
 
-	errs := make(chan error)
+	errChan := make(chan error)
 
+	//handle shutdown signals
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		errs <- fmt.Errorf("%s", <-sig)
+		errChan <- fmt.Errorf("%s", <-sig)
 	}()
 
-	objectIds := newObjectRequest()
+	objList := newObjectList()
+	ready := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	callbackHandler := mux.NewRouter()
-	callbackHandler.HandleFunc("/callback", objectIds.callback()).Methods("GET")
-	go func() {
-		log.Printf("listening on port %s for object ids\n", *callbackHTTPAddr)
-		http.ListenAndServe(*callbackHTTPAddr, callbackHandler)
-	}()
-
-	objectInfoHandler := mux.NewRouter()
-	objectInfoHandler.HandleFunc("/", objectIds.fetchDetail()).Methods("GET")
-	go func() {
-		log.Printf("listening on port %s for object info by id\n", *objectInfoHTTPAddr)
-		http.ListenAndServe(*objectInfoHTTPAddr, objectInfoHandler)
-	}()
-
-	go func() {
-		log.Println("listening on port", *httpAddr)
-		log.Fatal(http.ListenAndServe(*httpAddr, nil))
-	}()
-
-	log.Println("exit", <-errs)
-	log.Println("finished")
-}
-
-//objectIDs receives the IDs from localhost:9090/callback
-func (objectIDs *ObjectList) callback() func(_ http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-
-		ticker := time.NewTicker(time.Second * 5)
-		for range ticker.C {
-			if r.Body == nil {
-				continue
-			}
-
-			if err := json.NewDecoder(r.Body).Decode(&objectIDs); err != nil {
-				log.Println("error retrieving object ids")
-				http.Error(w, "error retrieving object ids", http.StatusBadRequest)
-				return
-			}
-			fmt.Fprintln(w, "received object ids")
-		}
-	}
-}
-
-type result struct {
-	index int
-	item  ObjectDetail
-	err   error
-}
-
-// fetchDetail calls localhost:9010/objects/:id to receive details of an object by its id
-func (objectIDs ObjectList) fetchDetail() func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		resChan := make(chan result)
-
-		for idx, id := range objectIDs.ObjectIDs {
-			path := fmt.Sprintf("objects/:%d", id)
-
-			go func(url string, index int) {
-				resp, err := http.Get(url)
-				if err != nil {
-					resChan <- result{index: index, err: err}
-				}
-				defer resp.Body.Close()
-
-				obj := ObjectDetail{}
-				if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
-					resChan <- result{err: err}
-				}
-
-				obj.LastSeen = time.Now()
-
-				resChan <- result{index: index, item: obj}
-			}(path, idx)
-		}
-
-		objectsInfo := make([]ObjectDetail, len(objectIDs.ObjectIDs))
-		for res := range resChan {
-			if res.err != nil {
-				continue
-			}
-			objectsInfo[res.index] = res.item
-
-		}
-		
-		filter(objectsInfo)
-		store(objectsInfo)
-	}
-}
-
-// store stores object details to psql
-func store(objectsInfo []ObjectDetail) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if db == nil {
-			log.Println("db instance is nil")
-			http.Error(w, "db instance is nil", http.StatusInternalServerError)
+	// receive object ids from /callback path
+	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil {
+			log.Println("nil request body")
+			http.Error(w, "no request body found", http.StatusBadRequest)
 			return
 		}
 
-		for _, info := range objectsInfo {
-			sql := fmt.Sprintf("into into %s (id, online, lastseen) values($1, $2, $3)", dbname)
+		if err := json.NewDecoder(r.Body).Decode(&objList); err != nil {
+			log.Println("error decoding request")
+			http.Error(w, "error decoding request", http.StatusBadRequest)
+			return
+		}
 
-			if _, err := db.ExecContext(r.Context(), sql, info.ID, info.Online, info.LastSeen); err != nil {
-				log.Println("error inserting object details")
-				http.Error(w, "error inserting object details", http.StatusInternalServerError)
-				continue
+		log.Println("sent ids length: ", len(objList.ObjectIDs))
+		ready <- struct{}{}
+	})
+
+	resChan := make(chan result)
+	//goroutine that blocks until a new object id list has been received or context cancelled
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- errors.New("context cancelled")
+				return
+
+			case <-ready:
+				log.Println("received ids length: ", len(objList.ObjectIDs))
+
+				for _, id := range objList.ObjectIDs {
+					go func(objectID int) {
+						details, err := fetchDetail(objectID)
+						if err != nil {
+							resChan <- result{err: err}
+						}
+
+						resChan <- result{objectDetail: details}
+					}(id)
+				}
 			}
 		}
-		log.Println("inserted object details")
-		fmt.Fprintln(w, "inserted object details")
-	}
-}
+	}()
 
-// filter filters the list of objects by online status and stores in a hash table
-func filter(objectsInfo []ObjectDetail) map[bool]int {
-	res := make(map[bool]int)
-	for _, info := range objectsInfo {
-		res[info.Online] = info.ID
-	}
+	online := make([]ObjectDetail, 0)
+	offline := make([]ObjectDetail, 0)
 
-	return res
-}
+	statusChan := make(chan struct{})
+	pullDbData := make(chan struct{})
+	//goroutine that blocks until it receives details or possibly an error the the fetched detail or context cancelled
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- errors.New("context cancelled")
+				return
 
-func getenv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
+			case res := <-resChan:
+				if res.err != nil {
+					continue
+				}
+				if res.objectDetail.Online {
+					online = append(online, res.objectDetail)
+				} else {
+					offline = append(offline, res.objectDetail)
+				}
+				statusChan <- struct{}{}
+
+				if err := toStore(ctx, res.objectDetail); err != nil {
+					log.Println(err)
+					return
+				}
+
+				pullDbData <- struct{}{}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			<-pullDbData
+			details, err := fromStore(ctx)
+			if err != nil {
+				cancel()
+			}
+
+			for _, detail := range details {
+				if time.Since(detail.LastSeen) > time.Second*30 {
+					if err := deleteDetail(ctx, strconv.Itoa(detail.ID)); err != nil {
+						log.Printf("error deleting detail, id %d: %v", detail.ID, err)
+						return
+					}
+				}
+			}
+
+		}
+	}()
+
+	// access to object details filtered by online status
+	go func() {
+		for {
+			<-statusChan
+			//fmt.Println("online", len(online))
+			//fmt.Println("offline", len(offline))
+		}
+	}()
+
+	//listening for callback
+	go func() {
+		log.Printf("listening on port %s for callback\n", *callbackAddr)
+		if err := http.ListenAndServe(*callbackAddr, nil); err != nil {
+			errChan <- err
+			cancel()
+		}
+	}()
+
+	log.Println("exit: ", <-errChan)
 }
