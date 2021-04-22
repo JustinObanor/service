@@ -11,4 +11,4 @@ docker exec -it objects bash
 psql -h localhost -p 5432 -U postgres
 create database objects;
 \c objects
-create table objects (id integer, online bool, lastseen character varying);
+create table objects (id integer, online bool, lastseen timestamp with time zone);

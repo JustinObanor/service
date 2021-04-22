@@ -4,14 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,14 +29,19 @@ type ObjectDetail struct {
 	LastSeen time.Time
 }
 
-// result is a ds that holds possible errors and/or object details using a channel while fetching the detail of an object
-type result struct {
-	objectDetail ObjectDetail
-	err          error
+type database struct {
+	db *sql.DB
+}
+
+type client struct {
+	cli     *http.Client
+	workers int
+	path    string
+
+	sync.RWMutex
 }
 
 var (
-	db       *sql.DB
 	host     = getenv("PSQL_HOST", "objects")
 	port     = getenv("PSQL_PORT", "5432")
 	user     = getenv("PSQL_USER", "postgres")
@@ -45,29 +49,52 @@ var (
 	dbname   = getenv("PSQL_DB_NAME", "objects")
 )
 
+//new list of object ids
 func newObjectList() *ObjectList {
 	return &ObjectList{
 		ObjectIDs: make([]int, 0, 200),
 	}
 }
 
-func init() {
-	var err error
-	db, err = sql.Open("postgres", fmt.Sprintf(`host=%s port=%s user=%s
+//new http client for posting to path
+func newHTTPClient() *client {
+	return &client{
+		cli: &http.Client{
+			Timeout: time.Second * 5,
+		},
+		workers: 5,
+		path:    "http://host.docker.internal:9010/objects/",
+	}
+}
+
+//new psql database connection
+func newDatabase() (*database, error) {
+	db, err := sql.Open("postgres", fmt.Sprintf(`host=%s port=%s user=%s
 		password=%s dbname=%s sslmode=disable`,
 		host, port, user, password, dbname))
 	if err != nil {
-		log.Fatal("error opening connection to postgres: ", err)
+		return nil, err
 	}
 	if err := db.Ping(); err != nil {
-		log.Fatal("error pinging postgres client: ", err)
+		return nil, err
 	}
 	log.Printf("connected to psql client, host: %s\n", host)
+
+	return &database{
+		db: db,
+	}, nil
 }
 
 func main() {
-	callbackAddr := flag.String("callback", ":9090", "http listen address for callbacks body")
+	db, err := newDatabase()
+	if err != nil {
+		log.Fatal("error connecting to psql", err)
+	}
 
+	objList := newObjectList()
+	req := newHTTPClient()
+
+	callbackAddr := flag.String("callback", ":9090", "http listen address for callbacks body")
 	flag.Parse()
 
 	errChan := make(chan error)
@@ -79,12 +106,16 @@ func main() {
 		errChan <- fmt.Errorf("%s", <-sig)
 	}()
 
-	objList := newObjectList()
-	ready := make(chan struct{})
+	jobs := make(chan []int)
+	seen := make(map[int]struct{})
+	result := make(chan ObjectDetail)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// receive object ids from /callback path
+	go req.worker(ctx, jobs, seen, result)
+
+	//receive object ids from /callback path
 	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		if r.Body == nil {
 			log.Println("nil request body")
@@ -97,97 +128,21 @@ func main() {
 			http.Error(w, "error decoding request", http.StatusBadRequest)
 			return
 		}
-
-		log.Println("sent ids length: ", len(objList.ObjectIDs))
-		ready <- struct{}{}
+		jobs <- objList.ObjectIDs
 	})
 
-	resChan := make(chan result)
-	//goroutine that blocks until a new object id list has been received or context cancelled
+	for i := 0; i < req.workers; i++ {
+		go db.filter(ctx, result)
+	}
+
 	go func() {
 		for {
-			select {
-			case <-ctx.Done():
-				errChan <- errors.New("context cancelled")
-				return
-
-			case <-ready:
-				log.Println("received ids length: ", len(objList.ObjectIDs))
-
-				for _, id := range objList.ObjectIDs {
-					go func(objectID int) {
-						details, err := fetchDetail(objectID)
-						if err != nil {
-							resChan <- result{err: err}
-						}
-
-						resChan <- result{objectDetail: details}
-					}(id)
-				}
-			}
-		}
-	}()
-
-	online := make([]ObjectDetail, 0)
-	offline := make([]ObjectDetail, 0)
-
-	statusChan := make(chan struct{})
-	pullDbData := make(chan struct{})
-	//goroutine that blocks until it receives details or possibly an error the the fetched detail or context cancelled
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				errChan <- errors.New("context cancelled")
-				return
-
-			case res := <-resChan:
-				if res.err != nil {
-					continue
-				}
-				if res.objectDetail.Online {
-					online = append(online, res.objectDetail)
-				} else {
-					offline = append(offline, res.objectDetail)
-				}
-				statusChan <- struct{}{}
-
-				if err := toStore(ctx, res.objectDetail); err != nil {
-					log.Println(err)
+			for range time.NewTicker(time.Second * 5).C {
+				err := db.deleteDetail(ctx)
+				if err != nil {
 					return
 				}
-
-				pullDbData <- struct{}{}
 			}
-		}
-	}()
-
-	go func() {
-		for {
-			<-pullDbData
-			details, err := fromStore(ctx)
-			if err != nil {
-				cancel()
-			}
-
-			for _, detail := range details {
-				if time.Since(detail.LastSeen) > time.Second*30 {
-					if err := deleteDetail(ctx, strconv.Itoa(detail.ID)); err != nil {
-						log.Printf("error deleting detail, id %d: %v", detail.ID, err)
-						return
-					}
-				}
-			}
-
-		}
-	}()
-
-	// access to object details filtered by online status
-	go func() {
-		for {
-			<-statusChan
-			//fmt.Println("online", len(online))
-			//fmt.Println("offline", len(offline))
 		}
 	}()
 
