@@ -30,13 +30,15 @@ type ObjectDetail struct {
 }
 
 type database struct {
-	db *sql.DB
+	db      *sql.DB
+	errChan chan error
 }
 
 type client struct {
 	cli     *http.Client
 	workers int
 	path    string
+	errChan chan error
 
 	sync.RWMutex
 }
@@ -57,18 +59,19 @@ func newObjectList() *ObjectList {
 }
 
 //new http client for posting to path
-func newHTTPClient() *client {
+func newHTTPClient(count int) *client {
 	return &client{
 		cli: &http.Client{
 			Timeout: time.Second * 5,
 		},
-		workers: 5,
-		path:    "http://host.docker.internal:9010/objects/",
+		workers: count,
+		errChan: make(chan error, count),
+		path:    "http://localhost:9010/objects/",
 	}
 }
 
 //new psql database connection
-func newDatabase() (*database, error) {
+func newDatabase(count int) (*database, error) {
 	db, err := sql.Open("postgres", fmt.Sprintf(`host=%s port=%s user=%s
 		password=%s dbname=%s sslmode=disable`,
 		host, port, user, password, dbname))
@@ -81,18 +84,19 @@ func newDatabase() (*database, error) {
 	log.Printf("connected to psql client, host: %s\n", host)
 
 	return &database{
-		db: db,
+		db:      db,
+		errChan: make(chan error, count),
 	}, nil
 }
 
 func main() {
-	db, err := newDatabase()
+	db, err := newDatabase(5)
 	if err != nil {
 		log.Fatal("error connecting to psql", err)
 	}
 
 	objList := newObjectList()
-	req := newHTTPClient()
+	cli := newHTTPClient(5)
 
 	callbackAddr := flag.String("callback", ":9090", "http listen address for callbacks body")
 	flag.Parse()
@@ -106,14 +110,18 @@ func main() {
 		errChan <- fmt.Errorf("%s", <-sig)
 	}()
 
-	jobs := make(chan []int)
+	jobs := make(chan []int, cli.workers)
 	seen := make(map[int]struct{})
-	result := make(chan ObjectDetail)
+	result := make(chan ObjectDetail, cli.workers)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go req.worker(ctx, jobs, seen, result)
+	// for i := 0; i < 30; i++ {
+	go cli.worker(ctx, jobs, seen, result)
+	// }
+
+	go cli.errors()
 
 	//receive object ids from /callback path
 	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -128,23 +136,15 @@ func main() {
 			http.Error(w, "error decoding request", http.StatusBadRequest)
 			return
 		}
+		fmt.Println("got ids length: ", len(objList.ObjectIDs))
 		jobs <- objList.ObjectIDs
 	})
 
-	for i := 0; i < req.workers; i++ {
-		go db.filter(ctx, result)
-	}
+	go db.filter(ctx, result)
 
-	go func() {
-		for {
-			for range time.NewTicker(time.Second * 5).C {
-				err := db.deleteDetail(ctx)
-				if err != nil {
-					return
-				}
-			}
-		}
-	}()
+	go db.errors()
+
+	go db.deleteDetail(ctx)
 
 	//listening for callback
 	go func() {

@@ -20,19 +20,23 @@ func (db *database) toStore(ctx context.Context, detail ObjectDetail) error {
 	return nil
 }
 
-func (db *database) deleteDetail(ctx context.Context) error {
-	query := "delete from objects where lastseen < now() - interval '30 seconds'"
+func (db *database) deleteDetail(ctx context.Context) {
+	for {
+		for range time.NewTicker(time.Second * 5).C {
+			query := "delete from objects where lastseen < now() - interval '30 seconds'"
 
-	if _, err := db.db.ExecContext(ctx, query); err != nil {
-		return err
+			if _, err := db.db.ExecContext(ctx, query); err != nil {
+				db.errChan <- err
+				continue
+			}
+		}
 	}
-	return nil
 }
 
 // fetchDetail calls localhost:9010/objects/id to receive details of an object by its id
 func (c *client) fetchDetail(ctx context.Context, objectID int) (ObjectDetail, error) {
 	path := c.path + strconv.Itoa(objectID)
-	req, err := http.NewRequestWithContext(ctx, "POST", path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, nil)
 	if err != nil {
 		return ObjectDetail{}, err
 	}

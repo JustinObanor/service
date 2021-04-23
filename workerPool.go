@@ -2,30 +2,32 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 )
 
 //worker blocks until the object ids are available, and sends gotten details to result
-func (req *client) worker(ctx context.Context, jobs <-chan []int, seen map[int]struct{}, result chan<- ObjectDetail) {
+func (c *client) worker(ctx context.Context, jobs <-chan []int, seen map[int]struct{}, result chan<- ObjectDetail) {
 	for {
 		for ids := range jobs {
+			fmt.Println("got ids length: ", len(ids))
 			for _, objectID := range ids {
-				req.RLock()
+				c.RLock()
 				_, ok := seen[objectID]
-				req.RUnlock()
+				c.RUnlock()
 				if ok {
 					continue
 				}
-
-				req.Lock()
+				fmt.Println(objectID)
+				c.Lock()
 				seen[objectID] = struct{}{}
-				req.Unlock()
+				c.Unlock()
 
 				go func(id int) {
-					detail, err := req.fetchDetail(ctx, id)
+					detail, err := c.fetchDetail(ctx, id)
 					if err != nil {
-						log.Println(err)
+						c.errChan <- err
 						return
 					}
 
@@ -37,16 +39,35 @@ func (req *client) worker(ctx context.Context, jobs <-chan []int, seen map[int]s
 	}
 }
 
+func (c *client) errors() {
+	for {
+		for err := range c.errChan {
+			log.Println(err)
+		}
+	}
+}
+
 //filter pulls the details sent to the result channel by worker()
 func (db *database) filter(ctx context.Context, result <-chan ObjectDetail) {
 	for {
 		for detail := range result {
-			if detail.Online {
-				if err := db.toStore(ctx, detail); err != nil {
-					log.Println(err)
-					continue
-				}
+			if !detail.Online {
+				continue
 			}
+
+			if err := db.toStore(ctx, detail); err != nil {
+				db.errChan <- err
+				continue
+			}
+			fmt.Printf("%+v\n", detail)
+		}
+	}
+}
+
+func (db *database) errors() {
+	for {
+		for err := range db.errChan {
+			log.Println(err)
 		}
 	}
 }
