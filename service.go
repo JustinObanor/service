@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 )
@@ -21,14 +20,12 @@ func (db *database) toStore(ctx context.Context, detail ObjectDetail) error {
 }
 
 func (db *database) deleteDetail(ctx context.Context) {
-	for {
-		for range time.NewTicker(time.Second * 5).C {
-			query := "delete from objects where lastseen < now() - interval '30 seconds'"
+	for range time.NewTicker(time.Second * 5).C {
+		query := "delete from objects where lastseen < now() - interval '30 seconds'"
 
-			if _, err := db.db.ExecContext(ctx, query); err != nil {
-				db.errChan <- err
-				continue
-			}
+		if _, err := db.db.ExecContext(ctx, query); err != nil {
+			db.errChan <- err
+			continue
 		}
 	}
 }
@@ -55,11 +52,4 @@ func (c *client) fetchDetail(ctx context.Context, objectID int) (ObjectDetail, e
 	detail.LastSeen = time.Now()
 
 	return detail, nil
-}
-
-func getenv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
 }

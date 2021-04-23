@@ -39,6 +39,7 @@ type client struct {
 	workers int
 	path    string
 	errChan chan error
+	seen    map[int]struct{}
 
 	sync.RWMutex
 }
@@ -65,8 +66,10 @@ func newHTTPClient(count int) *client {
 			Timeout: time.Second * 5,
 		},
 		workers: count,
+		//can be different size
 		errChan: make(chan error, count),
-		path:    "http://localhost:9010/objects/",
+		seen:    make(map[int]struct{}),
+		path:    "http://host.docker.internal:9010/objects/",
 	}
 }
 
@@ -90,13 +93,13 @@ func newDatabase(count int) (*database, error) {
 }
 
 func main() {
-	db, err := newDatabase(5)
+	db, err := newDatabase(100)
 	if err != nil {
 		log.Fatal("error connecting to psql", err)
 	}
 
 	objList := newObjectList()
-	cli := newHTTPClient(5)
+	cli := newHTTPClient(100)
 
 	callbackAddr := flag.String("callback", ":9090", "http listen address for callbacks body")
 	flag.Parse()
@@ -110,16 +113,15 @@ func main() {
 		errChan <- fmt.Errorf("%s", <-sig)
 	}()
 
-	jobs := make(chan []int, cli.workers)
-	seen := make(map[int]struct{})
+	jobs := make(chan int, cli.workers)
 	result := make(chan ObjectDetail, cli.workers)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// for i := 0; i < 30; i++ {
-	go cli.worker(ctx, jobs, seen, result)
-	// }
+	for i := 0; i < 1_000; i++ {
+		go cli.worker(ctx, jobs, result)
+	}
 
 	go cli.errors()
 
@@ -136,11 +138,15 @@ func main() {
 			http.Error(w, "error decoding request", http.StatusBadRequest)
 			return
 		}
-		fmt.Println("got ids length: ", len(objList.ObjectIDs))
-		jobs <- objList.ObjectIDs
+
+		for i := range objList.ObjectIDs {
+			jobs <- objList.ObjectIDs[i]
+		}
 	})
 
-	go db.filter(ctx, result)
+	for i := 0; i < 500; i++ {
+		go db.filter(ctx, result)
+	}
 
 	go db.errors()
 
@@ -156,4 +162,14 @@ func main() {
 	}()
 
 	log.Println("exit: ", <-errChan)
+	fmt.Println("hereb")
+	close(jobs)
+	close(result)
+}
+
+func getenv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
 }
