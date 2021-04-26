@@ -162,7 +162,6 @@ func main() {
 	}()
 
 	log.Println("exit: ", <-errChan)
-	fmt.Println("hereb")
 	close(jobs)
 	close(result)
 }
